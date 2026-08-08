@@ -442,6 +442,141 @@ bool readHomeSensor(AxisId a) {
   return (s1 == HIGH && s2 == HIGH && s3 == HIGH);
 }
 
+// Rutina de detección automática de dirección real del motor.
+// Mueve el eje en dirección "backward" buscando el sensor home hasta 60% del recorrido máximo.
+// Si no lo encuentra, vuelve a la posición y prueba con la dirección invertida.
+// Si lo encuentra con la dirección invertida, guarda el nuevo dirForwardLevel en NVS.
+// Devuelve true si la dirección quedó determinada y firstRun se marcó false.
+bool detectDirection(AxisId a) {
+  if (!actuatorsEnabled) {
+    ax[a].lastError = "actuators disabled";
+    return false;
+  }
+
+  machineState = HOMING;
+  ax[a].isMoving = true;
+  ax[a].lastError = "";
+  limitTriggered[a] = false;
+
+  uint32_t probeSteps = (uint32_t)(ax[a].maxTravel * ax[a].stepsPerMm * 0.6f);
+  if (probeSteps > 120000UL) probeSteps = 120000UL;
+
+  // Si el sensor ya está activo, alejarse (forward) hasta liberarlo
+  if (readHomeSensor(a) || limitTriggered[a]) {
+    limitTriggered[a] = false;
+    setAxisDirection(a, true);
+    ax[a].moveDir = "forward";
+    uint32_t clearSteps = (uint32_t)(5.0f * ax[a].stepsPerMm);
+    for (uint32_t i = 0; i < clearSteps; i++) {
+      if (!actuatorsEnabled) { machineState = ALARM; ax[a].isMoving = false; return false; }
+      if (!readHomeSensor(a) && !limitTriggered[a]) { limitTriggered[a] = false; break; }
+      pulseAxis(a, true);
+      delayMicroseconds(ax[a].homingBackoffUs);
+      yield();
+    }
+    // Si sigue activo, probar con la dirección contraria
+    if (readHomeSensor(a) || limitTriggered[a]) {
+      limitTriggered[a] = false;
+      ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+      setAxisDirection(a, true);
+      for (uint32_t i = 0; i < clearSteps; i++) {
+        if (!actuatorsEnabled) {
+          ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+          machineState = ALARM; ax[a].isMoving = false; return false;
+        }
+        if (!readHomeSensor(a) && !limitTriggered[a]) { limitTriggered[a] = false; break; }
+        pulseAxis(a, true);
+        delayMicroseconds(ax[a].homingBackoffUs);
+        yield();
+      }
+      if (readHomeSensor(a) || limitTriggered[a]) {
+        ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+        ax[a].lastError = "detect_dir: no se pudo liberar sensor";
+        machineState = ALARM; ax[a].isMoving = false; return false;
+      }
+    }
+    limitTriggered[a] = false;
+    delay(50);
+  }
+
+  // --- Intento 1: dirección backward actual ---
+  setAxisDirection(a, false);
+  ax[a].moveDir = "backward";
+  bool found = false;
+
+  for (uint32_t i = 0; i < probeSteps; i++) {
+    if (!actuatorsEnabled) { machineState = ALARM; ax[a].isMoving = false; return false; }
+    if (limitTriggered[a] || readHomeSensor(a)) {
+      limitTriggered[a] = false;
+      found = true;
+      break;
+    }
+    pulseAxis(a, false);
+    delayMicroseconds(ax[a].homingSeekUs);
+    yield();
+  }
+
+  if (found) {
+    // Dirección original era correcta
+    ax[a].firstRun = false;
+    ax[a].isMoving = false;
+    ax[a].moveDir = "none";
+    machineState = IDLE;
+    saveNVS();
+    return true;
+  }
+
+  // Sensor no encontrado: volver a la posición de inicio
+  setAxisDirection(a, true);
+  ax[a].moveDir = "forward";
+  for (uint32_t i = 0; i < probeSteps; i++) {
+    if (!actuatorsEnabled) { machineState = ALARM; ax[a].isMoving = false; return false; }
+    pulseAxis(a, true);
+    delayMicroseconds(ax[a].homingSeekUs);
+    yield();
+  }
+  delay(50);
+  limitTriggered[a] = false;
+
+  // --- Intento 2: dirección invertida ---
+  ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+  setAxisDirection(a, false);
+  ax[a].moveDir = "backward";
+  found = false;
+
+  for (uint32_t i = 0; i < probeSteps; i++) {
+    if (!actuatorsEnabled) {
+      ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+      machineState = ALARM; ax[a].isMoving = false; return false;
+    }
+    if (limitTriggered[a] || readHomeSensor(a)) {
+      limitTriggered[a] = false;
+      found = true;
+      break;
+    }
+    pulseAxis(a, false);
+    delayMicroseconds(ax[a].homingSeekUs);
+    yield();
+  }
+
+  if (!found) {
+    // Revertir el flip, no se pudo determinar dirección
+    ax[a].dirForwardLevel = (ax[a].dirForwardLevel == HIGH) ? LOW : HIGH;
+    ax[a].lastError = "detect_dir: sensor no encontrado en ninguna direccion";
+    machineState = ALARM;
+    ax[a].isMoving = false;
+    return false;
+  }
+
+  // Dirección invertida era la correcta, guardar
+  ax[a].firstRun = false;
+  ax[a].isMoving = false;
+  ax[a].moveDir = "none";
+  machineState = IDLE;
+  saveNVS();
+  return true;
+}
+
 bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
   if (!actuatorsEnabled) {
     ax[a].lastError = "actuators disabled";
@@ -465,11 +600,23 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
 
   if (backoffSteps > 0) ax[a].backoffSteps = backoffSteps;
 
+  // Si es el primer uso, ejecutar detección automática de dirección antes de homear
+  if (ax[a].firstRun) {
+    if (!detectDirection(a)) {
+      return false; // machineState ya seteado en detectDirection
+    }
+    // Reiniciar estado de homing tras la detección
+    machineState = HOMING;
+    ax[a].homed = false;
+    ax[a].isMoving = true;
+  }
+
   limitTriggered[a] = false;
   limitCount[a] = 0;
 
-  // Si el sensor ya está activo al iniciar, alejarse hacia adelante hasta liberarlo (hasta 5 mm máximo)
-  if (readHomeSensor(a)) {
+  // Pre-liberación: si el sensor ya está activo al iniciar, alejarse (forward) hasta liberarlo
+  if (readHomeSensor(a) || limitTriggered[a]) {
+    limitTriggered[a] = false;
     setAxisDirection(a, true);
     ax[a].moveDir = "forward";
     uint32_t releaseSteps = (uint32_t)(5.0f * ax[a].stepsPerMm);
@@ -480,13 +627,15 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
         ax[a].isMoving = false;
         return false;
       }
-      pulseAxis(a, true);
-      delayMicroseconds(ax[a].homingBackoffUs);
-      yield();
-      if (!readHomeSensor(a)) {
+      // Verificar ANTES de pulsar
+      if (!readHomeSensor(a) && !limitTriggered[a]) {
+        limitTriggered[a] = false;
         released = true;
         break;
       }
+      pulseAxis(a, true);
+      delayMicroseconds(ax[a].homingBackoffUs);
+      yield();
     }
     if (!released) {
       machineState = ALARM;
@@ -494,6 +643,7 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
       ax[a].isMoving = false;
       return false;
     }
+    limitTriggered[a] = false;
     delay(50);
   }
 
@@ -510,7 +660,9 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
       ax[a].isMoving = false;
       return false;
     }
-    if (readHomeSensor(a)) {
+    // Verificar tanto lectura directa como flag ISR para no perder pulsos cortos
+    if (limitTriggered[a] || readHomeSensor(a)) {
+      limitTriggered[a] = false;
       sensorHit = true;
       break;
     }
@@ -544,6 +696,7 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
   }
 
   delay(50);
+  limitTriggered[a] = false;
 
   if (readHomeSensor(a)) {
     machineState = ALARM;
@@ -564,7 +717,9 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
       ax[a].isMoving = false;
       return false;
     }
-    if (readHomeSensor(a)) {
+    // Verificar tanto lectura directa como flag ISR
+    if (limitTriggered[a] || readHomeSensor(a)) {
+      limitTriggered[a] = false;
       sensorHit = true;
       break;
     }
@@ -687,6 +842,10 @@ bool handle(const char* cmd, JsonObjectConst p, String& er){
   if (c == "reset_step_counter") {
     ax[a].stepCount = 0;
     return true;
+  }
+
+  if (c == "detect_direction") {
+    return detectDirection(a);
   }
 
   if (c == "test_dir_pulse") {
