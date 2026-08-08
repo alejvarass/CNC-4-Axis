@@ -764,7 +764,7 @@ class MainWindow(QMainWindow):
         state_grid.addWidget(lbl_title_homing, 1, 0); state_grid.addWidget(self.lbl_homed_text, 1, 1)
         state_grid.addWidget(lbl_title_actuators, 2, 0); state_grid.addWidget(self.lbl_actuators_text, 2, 1)
         state_grid.addWidget(QLabel("Posición Actual:"), 3, 0); state_grid.addWidget(self.lbl_pos, 3, 1)
-        state_grid.addWidget(QLabel("Work Offset:"), 4, 0); state_grid.addWidget(self.lbl_woff, 4, 1)
+        state_grid.addWidget(QLabel("Work Offset (woff):"), 4, 0); state_grid.addWidget(self.lbl_woff, 4, 1)
         state_grid.addWidget(QLabel("Posición Objetivo:"), 5, 0); state_grid.addWidget(self.lbl_target_pos, 5, 1)
         state_grid.addWidget(QLabel("Estado Máquina:"), 6, 0); state_grid.addWidget(self.lbl_machine_state_v, 6, 1)
         state_grid.addWidget(QLabel("Eje Activo:"), 7, 0); state_grid.addWidget(self.lbl_axis_active, 7, 1)
@@ -1307,11 +1307,20 @@ class MainWindow(QMainWindow):
             return 0.0
 
     def _check_target_inside_soft_limit(self, target):
-        max_v = float(self.sp_main_max_travel.value())
-        soft_limit_max = max(0.0, max_v - 10.0)
-        
-        if target < 0.0 or target > soft_limit_max:
-            QMessageBox.warning(self, "Soft Limit", f"Objetivo {target:.3f} fuera de rango")
+        ax = self._axis_from_tab()
+        d = self.last_status.get("axes", {}).get(ax, {}) if isinstance(self.last_status.get("axes"), dict) else {}
+        try:
+            max_travel = float(d.get("max_travel", self.sp_main_max_travel.value()))
+            soft_offset_steps = float(d.get("soft_offset_steps", self.sp_soft_offset_steps.value()))
+            spm = float(d.get("steps_per_mm", 568.0))
+            soft_min = soft_offset_steps / spm if spm > 0 else 0.0
+        except Exception:
+            max_travel = float(self.sp_main_max_travel.value())
+            soft_min = 0.0
+
+        if target < soft_min or target > max_travel:
+            self._log("WARN", f"Soft limit: objetivo {target:.3f} mm fuera de [{soft_min:.3f}, {max_travel:.3f}] mm")
+            QMessageBox.warning(self, "Soft Limit", f"Objetivo {target:.3f} mm fuera de rango [{soft_min:.3f}, {max_travel:.3f}] mm")
             return False
         return True
 
@@ -1338,30 +1347,23 @@ class MainWindow(QMainWindow):
         """Actualiza la posición de forma suave sin esperar status"""
         ax = self._axis_from_tab()
         d = self.last_status.get("axes", {}).get(ax, {}) if isinstance(self.last_status.get("axes"), dict) else {}
-        
+
         if not d:
             return
-        
-        # Solo actualizar suavemente si está en movimiento manual
+
         if d.get("is_moving", False) and d.get("move_dir", "none") != "none":
             try:
                 pos = float(d.get("pos", 0.0))
                 spm = float(d.get("steps_per_mm", 568.0))
-                
+
                 if spm > 0:
-                    # Actualizar posición localmente sin esperar respuesta
                     if d.get("move_dir") == "forward":
                         pos += (1.0 / spm)
                     elif d.get("move_dir") == "backward":
                         pos -= (1.0 / spm)
-                    
-                    # Actualizar display
-                    max_travel_val = float(d.get("max_travel", 110.0))
-                    soft_limit = max(0.0, max_travel_val - 10.0)
-                    
+
                     self.lbl_pos.setText(f"{pos:.3f} mm")
-                    self.lbl_woff.setText(f"{soft_limit:.3f} mm")
-                    
+
             except Exception:
                 pass
 
@@ -1428,10 +1430,8 @@ class MainWindow(QMainWindow):
             try:
                 pos = float(d.get("pos", 0.0))
                 target_pos = float(d.get("target_pos", pos))
-                max_travel_val = float(d.get("max_travel", self.sp_main_max_travel.value()))
-                
-                soft_limit_woff = max(0.0, max_travel_val - 10.0)
-                
+                woff = float(d.get("work_offset", 0.0))
+
                 if "step_count" in d:
                     self.axis_tabs[ax].set_steps_count(int(d["step_count"]))
 
@@ -1439,10 +1439,10 @@ class MainWindow(QMainWindow):
                 self._is_moving = is_moving
 
             except Exception:
-                pos, target_pos, soft_limit_woff = 0.0, 0.0, 0.0
+                pos, target_pos, woff = 0.0, 0.0, 0.0
 
             self.lbl_pos.setText(f"{pos:.3f} mm")
-            self.lbl_woff.setText(f"{soft_limit_woff:.3f} mm")
+            self.lbl_woff.setText(f"{woff:.3f} mm")
             self.lbl_target_pos.setText(f"{target_pos:.3f} mm")
 
             homed_ok = bool(d.get("homed", False))
