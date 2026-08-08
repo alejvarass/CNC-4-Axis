@@ -631,6 +631,8 @@ void buildStatus(JsonObject p){
     a["manual_us"] = ax[i].manualUs;
     a["home_seek_us"] = ax[i].homingSeekUs;
     a["home_backoff_us"] = ax[i].homingBackoffUs;
+    a["backoff_steps"] = ax[i].backoffSteps;
+    a["soft_offset_steps"] = ax[i].softLimitOffsetSteps;
     a["last_error"] = ax[i].lastError;
   }
 }
