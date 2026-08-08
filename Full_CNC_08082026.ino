@@ -147,7 +147,10 @@ void pulseAxis(AxisId a, bool isForward) {
   }
 }
 
-bool inLim(AxisId a, float v){ return !(v < 0.0f || v > ax[a].maxTravel); }
+bool inLim(AxisId a, float v){
+  float softMin = ax[a].softLimitOffsetSteps / ax[a].stepsPerMm;
+  return !(v < softMin || v > ax[a].maxTravel);
+}
 
 void clearManualFlags(AxisId a){
   ax[a].manualForward = false;
@@ -430,6 +433,15 @@ bool moveRel(AxisId a, float dz){
   return moveAbs(a, ax[a].pos + dz);
 }
 
+bool readHomeSensor(AxisId a) {
+  int s1 = digitalRead(hw[a].pinLimitHome);
+  delayMicroseconds(50);
+  int s2 = digitalRead(hw[a].pinLimitHome);
+  delayMicroseconds(50);
+  int s3 = digitalRead(hw[a].pinLimitHome);
+  return (s1 == HIGH && s2 == HIGH && s3 == HIGH);
+}
+
 bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
   if (!actuatorsEnabled) {
     ax[a].lastError = "actuators disabled";
@@ -441,7 +453,7 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
   ax[a].homed = false;
   ax[a].isMoving = true;
   ax[a].lastError = "";
-  
+
   if (softOffsetSteps > 0 && softOffsetSteps <= 200000) {
     ax[a].softLimitOffsetSteps = softOffsetSteps;
   } else if (softOffsetSteps > 200000) {
@@ -450,30 +462,58 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
     ax[a].isMoving = false;
     return false;
   }
-  
+
   if (backoffSteps > 0) ax[a].backoffSteps = backoffSteps;
 
-  // FASE 1: BÚSQUEDA RÁPIDA (hacia home)
+  limitTriggered[a] = false;
+  limitCount[a] = 0;
+
+  // Si el sensor ya está activo al iniciar, alejarse hacia adelante hasta liberarlo (hasta 5 mm máximo)
+  if (readHomeSensor(a)) {
+    setAxisDirection(a, true);
+    ax[a].moveDir = "forward";
+    uint32_t releaseSteps = (uint32_t)(5.0f * ax[a].stepsPerMm);
+    bool released = false;
+    for (uint32_t i = 0; i < releaseSteps; i++) {
+      if (!actuatorsEnabled) {
+        machineState = ALARM;
+        ax[a].isMoving = false;
+        return false;
+      }
+      pulseAxis(a, true);
+      delayMicroseconds(ax[a].homingBackoffUs);
+      yield();
+      if (!readHomeSensor(a)) {
+        released = true;
+        break;
+      }
+    }
+    if (!released) {
+      machineState = ALARM;
+      ax[a].lastError = "sensor already engaged, cannot release";
+      ax[a].isMoving = false;
+      return false;
+    }
+    delay(50);
+  }
+
+  // FASE 1: BÚSQUEDA RÁPIDA hacia el home (backward)
   setAxisDirection(a, false);
   ax[a].moveDir = "backward";
-  
-  uint32_t maxSearchSteps = (uint32_t)(ax[a].maxTravel * ax[a].stepsPerMm * 2.0f);
+
+  uint32_t maxSearchSteps = (uint32_t)(ax[a].maxTravel * ax[a].stepsPerMm * 1.2f);
   bool sensorHit = false;
 
   for (uint32_t i = 0; i < maxSearchSteps; i++) {
-    if (!actuatorsEnabled) { 
-      machineState = ALARM; 
-      ax[a].isMoving = false; 
-      return false; 
+    if (!actuatorsEnabled) {
+      machineState = ALARM;
+      ax[a].isMoving = false;
+      return false;
     }
-    
-    refreshAxisInputs(a);
-    if (limitTriggered[a]) { 
-      sensorHit = true; 
-      limitTriggered[a] = false;
-      break; 
+    if (readHomeSensor(a)) {
+      sensorHit = true;
+      break;
     }
-
     pulseAxis(a, false);
     delayMicroseconds(ax[a].homingSeekUs);
     yield();
@@ -486,51 +526,50 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
     return false;
   }
 
-  // FASE 2: RETROCESO RÁPIDO (se aleja del sensor)
+  delay(50);
+
+  // FASE 2: RETROCESO (pull-off) para liberar el sensor
   setAxisDirection(a, true);
   ax[a].moveDir = "forward";
-  
+
   for (uint32_t i = 0; i < ax[a].backoffSteps; i++) {
-    if (!actuatorsEnabled) { 
-      machineState = ALARM; 
-      ax[a].isMoving = false; 
-      return false; 
+    if (!actuatorsEnabled) {
+      machineState = ALARM;
+      ax[a].isMoving = false;
+      return false;
     }
     pulseAxis(a, true);
     delayMicroseconds(ax[a].homingBackoffUs);
     yield();
   }
 
-  refreshAxisInputs(a);
-  if (ax[a].limitHome) {
+  delay(50);
+
+  if (readHomeSensor(a)) {
     machineState = ALARM;
     ax[a].lastError = "back-off: sensor still engaged";
     ax[a].isMoving = false;
     return false;
   }
 
-  // FASE 3: APROXIMACIÓN LENTA (hacia home de nuevo, MÁS LENTO)
+  // FASE 3: REAPROXIMACIÓN LENTA hacia el home
   setAxisDirection(a, false);
   ax[a].moveDir = "backward";
   sensorHit = false;
 
   uint32_t maxFeedSteps = ax[a].backoffSteps * 2;
   for (uint32_t i = 0; i < maxFeedSteps; i++) {
-    if (!actuatorsEnabled) { 
-      machineState = ALARM; 
-      ax[a].isMoving = false; 
-      return false; 
+    if (!actuatorsEnabled) {
+      machineState = ALARM;
+      ax[a].isMoving = false;
+      return false;
     }
-    
-    refreshAxisInputs(a);
-    if (limitTriggered[a]) { 
-      sensorHit = true; 
-      limitTriggered[a] = false;
-      break; 
+    if (readHomeSensor(a)) {
+      sensorHit = true;
+      break;
     }
-
     pulseAxis(a, false);
-    delayMicroseconds(ax[a].homingFeedUs);  // MÁS LENTO que búsqueda
+    delayMicroseconds(ax[a].homingFeedUs);
     yield();
   }
 
@@ -541,40 +580,13 @@ bool homeAxis(AxisId a, uint32_t backoffSteps, uint32_t softOffsetSteps) {
     return false;
   }
 
-  // FASE 4: SEGUNDO RETROCESO (desde sensor nuevamente)
-  setAxisDirection(a, true);
-  ax[a].moveDir = "forward";
-  
-  for (uint32_t i = 0; i < ax[a].backoffSteps; i++) {
-    if (!actuatorsEnabled) { 
-      machineState = ALARM; 
-      ax[a].isMoving = false; 
-      return false; 
-    }
-    pulseAxis(a, true);
-    delayMicroseconds(ax[a].homingBackoffUs);
-    yield();
-  }
-
-  // FASE 5: OFFSET DE SEGURIDAD (final, lejos del home)
-  setAxisDirection(a, true);
-  ax[a].moveDir = "forward";
-  
-  for (uint32_t i = 0; i < ax[a].softLimitOffsetSteps; i++) {
-    if (!actuatorsEnabled) { 
-      machineState = ALARM; 
-      ax[a].isMoving = false; 
-      return false; 
-    }
-    pulseAxis(a, true);
-    delayMicroseconds(ax[a].homingBackoffUs);
-    yield();
-  }
-
-  ax[a].pos = 0.000f;
-  ax[a].targetPos = 0.000f;
+  // FASE 4: Fijar origen en el punto de detección lenta, sin moverse más.
+  // pos y stepCount reflejan el offset de soft limit para que inLim() sea consistente.
+  float softMin = (float)ax[a].softLimitOffsetSteps / ax[a].stepsPerMm;
+  ax[a].pos = softMin;
+  ax[a].targetPos = softMin;
   ax[a].woff = 0.000f;
-  ax[a].stepCount = 0;
+  ax[a].stepCount = (int64_t)ax[a].softLimitOffsetSteps;
   ax[a].homed = true;
   ax[a].isMoving = false;
   ax[a].moveDir = "none";
