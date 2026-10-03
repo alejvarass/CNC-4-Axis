@@ -77,7 +77,9 @@ static const uint8_t LIMIT_ACTIVE_LEVEL = HIGH;          // NC a GND: abierto/ro
 
 // E-STOP físico (opcional). -1 = no instalado. Recomendado GPIO33, contacto NC a GND
 // con pull-up interno: seta pulsada o cable roto = nivel ALTO = alarma.
+#ifndef PIN_ESTOP_INPUT
 #define PIN_ESTOP_INPUT   -1
+#endif
 static const uint8_t ESTOP_ACTIVE_LEVEL = HIGH;
 
 // Los pines STEP deben estar en el banco GPIO 0..31 (escritura por registro W1TS/W1TC).
